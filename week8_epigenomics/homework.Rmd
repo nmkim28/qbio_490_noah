@@ -1,0 +1,168 @@
+---
+title: "homework"
+output: html_notebook
+---
+# Setup
+```{r setup}
+knitr::opts_knit$set(root.dir = normalizePath("~/490_cluster/analysis_data"))
+```
+
+```{r}
+library(limma)
+library(ggplot2)
+library(DESeq2)
+
+methylation_clinical <- read.csv('brca_methylation_clinical.csv', row.names = 1)
+cpg_sites <- read.csv('brca_cpg_sites.csv', row.names = 1)
+
+if (file.exists('brca_methylation_betas.rds')) {
+  betas <- readRDS('brca_methylation_betas.rds')
+} else {
+  betas <- read.csv('brca_methylation_betas.csv', row.names = 1)
+  saveRDS(betas, 'brca_methylation_betas.rds')
+}
+```
+
+
+
+# (1) Naive Differential Methylation
+
+```{r}
+#masking out samples that aren't Metastatic or Primary solid Tumor
+na_mask <- methylation_clinical$definition %in% c("Metastatic", "Primary solid Tumor")
+methylation_clinical <- methylation_clinical[na_mask,]
+betas_clean <- betas[,na_mask]
+
+
+methylation_clinical$metastasis_category <- ifelse(methylation_clinical$definition == "Metastatic", "metastatic", "non_metastatic")
+
+non_metastatic_mask <- methylation_clinical$metastasis_category == "non_metastatic"
+methylation_clinical$metastatic <- !non_metastatic_mask #metastatic is comparison, non-metastatic is base
+
+table(methylation_clinical$metastasis_category)
+
+#fitting linear models using a "target value"
+betas_m <- as.matrix(betas_clean)
+betas_m[betas_m < 0.001] <- 0.001 
+betas_m[betas_m > 0.999] <- 0.999
+mval <- log2(betas_m / (1 - betas_m))
+
+
+design <- model.matrix(~ metastatic, data = methylation_clinical)
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+
+```{r}
+# Extracting model into dataframe
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(p.adjust(fit2[["p.value"]][,2],method='BY')), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+
+# Visualization
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+ggplot(data=dat, aes(x=foldchange, y = logPvalue, color = threshold)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  ggtitle("Metastatic vs Non-Metastatic BRCA Methylation") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# Saving results to a .csv file
+write.csv(dat, "methylation_results_metastatic.csv")
+```
+
+Many more CpG Sites are on left meaning negative fold change and little amount of points actually sit in the top-right box, meaning very few are actually significant. Only some site in general are actually significant with most being below the -log p value horizontlaly set. Overall, shows broad hypomethylation, but low statistical power is likely why it's not significant enough to say anything for certain.
+
+# (2) Direct comparison of methylation and transcription
+
+```{r}
+rna_clinical <- read.csv("brca_rna_clinical_data.csv", row.names = 1)
+rna_genes <- read.csv("brca_rna_gene_data.csv")
+rna_counts <- read.csv("brca_rna_count_data.csv", row.names = 1)
+```
+
+```{r}
+# DESeq: metastatic vs non-metastatic, using the methylation clinical data for group labels
+# (saves results so it only has to run once)
+if (file.exists("brca_DESeq_results_metastatic.csv")) {
+  de_results <- read.csv("brca_DESeq_results_metastatic.csv", row.names = 1)
+} else {
+  # match RNA samples to methylation samples by sample ID (first 16 characters of the barcode)
+  rna_sample_ids <- substr(gsub("\\.", "-", colnames(rna_counts)), 1, 16)
+  shared <- rna_sample_ids %in% methylation_clinical$sample
+
+  deseq_counts <- rna_counts[, shared]
+  deseq_clinical <- methylation_clinical[match(rna_sample_ids[shared], methylation_clinical$sample), ]
+  rownames(deseq_clinical) <- colnames(deseq_counts)
+  deseq_clinical$metastasis_category <- factor(deseq_clinical$metastasis_category,
+                                               levels = c("non_metastatic", "metastatic"))
+  print(table(deseq_clinical$metastasis_category))
+
+  # filter out genes with total expression < 20
+  deseq_counts <- deseq_counts[rowSums(deseq_counts) >= 20, ]
+
+  dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(deseq_counts)),
+                                colData = deseq_clinical,
+                                design = ~ metastasis_category)
+  dds <- DESeq(dds, parallel = TRUE, BPPARAM = BiocParallel::MulticoreParam(6))
+  de_results <- as.data.frame(results(dds, contrast = c("metastasis_category", "metastatic", "non_metastatic")))
+  de_results$gene_name <- rna_genes$gene_name[match(rownames(de_results), rna_genes$gene_id)]
+  write.csv(de_results, "brca_DESeq_results_metastatic.csv")
+}
+```
+
+```{r}
+# Extract genes of interest
+downregulated <- de_results[which(de_results$log2FoldChange < -1 & de_results$padj < 0.05), 'gene_name']
+hypermethylated <- dat[dat$foldchange > 1, 'geneName'] #fold-change cutoff of 1 to match the volcano plot lines (no p-value filter, as in the demo; too few sites were significant with only 7 metastatic samples)
+
+interest_genes <- intersect(downregulated, hypermethylated)
+interest_genes
+```
+```{r}
+# Explore your gene of interest
+GENE <- interest_genes[1] 
+
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask <- cpg_sites$gene == GENE
+
+#What are we doing here? Making TRUE/FALSE masks that mark which patients are metastatic vs non-metastatic in the RNA and methylation clinical data
+rna_clinical_metastatic <- rna_clinical$definition == "Metastatic"
+methylation_clinical_metastatic <- methylation_clinical$metastasis_category == "metastatic"
+
+rna_clinical_non_metastatic <- rna_clinical$definition == "Primary solid Tumor"
+methylation_clinical_non_metastatic <- methylation_clinical$metastasis_category == "non_metastatic"
+
+#What are we doing here? Pulling out this gene's expression counts and CpG beta values for each group
+rna_metastatic <- as.numeric(unlist(rna_counts[gene_counts_mask, rna_clinical_metastatic]))
+methylation_metastatic <- (betas_clean[gene_betas_mask, methylation_clinical_metastatic])
+
+rna_non_metastatic <- as.numeric(unlist(rna_counts[gene_counts_mask, rna_clinical_non_metastatic]))
+methylation_non_metastatic <- (betas_clean[gene_betas_mask, methylation_clinical_non_metastatic])
+```
+
+```{r}
+# Show transcriptional differences
+boxplot(rna_non_metastatic, rna_metastatic, xlab='Group', ylab='Counts', names=c('non-metastatic', 'metastatic'),
+        col=c("blue","red"), main=paste(GENE, "expression"))
+```
+
+```{r}
+# Show methylation differences at CpG sites in this gene 
+plot(1:dim(methylation_non_metastatic)[1], apply(methylation_non_metastatic, 1, mean), col='blue', type='h', lwd=3, ylim=c(0,1), xlim=c(1, dim(methylation_non_metastatic)[1] + 0.5), ylab='Average Beta', xlab='CpG sites', main=paste(GENE, "methylation"))
+
+lines(1.3:(dim(methylation_metastatic)[1]+0.3), apply(methylation_metastatic, 1, mean), col='red', type='h', lwd=3)
+
+legend("bottomright",
+       legend=c("Non-metastatic", "Metastatic"),
+       col=c("blue", "red"),
+       lwd=3,
+       cex=0.7)
+```
+From the two plots shown, we can see that all 6 of the VDR CpG sites are highly methylated in both groups being quite similar average around 0.75 - 0.97. From the box plot, the median VDR count is slightly lower in metastatic samples, about 2,800 to 2,400. However, the boxes overalp heavily and non-metatstatic has many high outliers, while metastatic has a tighter range. What this means is that I believe direction loosely does match the expected pattern where some sites appear a bit more methylated in metastatic samples, and expression is slightly lower. It could be potentially useful to look into deeper, but nothing can be determinately said. One reason is the tiny sample size. lack of significance, and simply correlation. 
